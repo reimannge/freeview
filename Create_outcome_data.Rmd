@@ -1,0 +1,510 @@
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(naniar)
+
+library(httr)
+library(jsonlite)
+
+library(boxr)
+library(openxlsx)
+
+library(stringr)
+
+library(haven)
+
+
+```
+
+
+
+
+```{r}
+
+#Functions to read and write from Box
+source('Read_Box_Functions.R')
+
+```
+
+
+Box API Tokens - Update these areas with token and desired output path
+```{r}
+# Generate token 
+# Configuration Link: https://carene.app.box.com/developers/console/app/2431769/configuration
+
+box_token <- 'mCC8LsDQgKrlMCQqovQInzcYOyW0K20Z'
+auth_header <- add_headers(Authorization = paste("Bearer", box_token))
+
+
+# Assign desired output path 
+# Navigate to output folder and copy id in the URL (ex. https://carene.app.box.com/folder/342486719038)
+baseline_processed_folder_id = '348165844236'
+eyetracking_cleaned_folder_id = '342468940685' 
+
+```
+
+
+
+Read Outcomes Data
+```{r}
+# # Read in outcomes data
+input_path = 'Freeview 2025/full USTBEST data files and code books/'
+files = read_box_folder(input_path)$name
+
+#Outcome and demographics file
+# filename = 'USTBEST_Merged_12.3.24.csv'
+filename = "USTREAT_ForML_RnRDemoUpdate.xlsx"
+
+temp_file = read_box_file(input_path,filename)
+
+df = read.xlsx(temp_file,na.strings = c("999","888",999,888)) 
+
+#Keep unique IDs
+df  =  distinct(df, PtID, .keep_all = TRUE)
+```
+
+Read Inclusions data
+```{r}
+## Read inclusions decisions list
+inclusions_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+
+filename = 'inclusion_decisions_EventMarker_meta_data_9.29.25.xlsx'
+temp_file = read_box_file(inclusions_path,filename)
+
+## Read in excluded subjects list
+subject_list = read_xlsx(temp_file)  
+
+
+
+```
+
+
+Identify subjects to include
+```{r}
+
+#Include only subjects with eye tracking data
+df_select = df[(df$PtID %in% subject_list$subject),] 
+
+```
+
+Select variables
+```{r}
+
+# Define multiple replacements
+replacements <- c(
+  "PM" = "_1mo_",
+  "TM" = "_3mo_",
+  "LA" = "_LA_",
+  "LT" = "_LT_",
+  "CR" = "_CR_"
+ )
+
+
+
+```
+
+Pull CSSRS items timepoint 1
+```{r}
+
+df_cssr_t1 <- df_select %>%
+  filter(PtID %in% subject_list$subject) %>%
+  select(
+    PtID,
+    # matches("CS01PMt1_R|CS03PMt1_R|CS05PMt1_R|CS07PMt1_R|CS08PMt1_R|CS12PMt1|CS14PMt1|CS15PMt1|CS23PMt1|CS28PMt1|CS30PMt1|CS32PMt1|CS34PMt1|CS39PMt1|CS40PMt1")) %>%
+    matches("CS01PMt1_R|CS03PMt1_R|CS05PMt1_R|CS07PMt1_R|CS08PMt1_R|CS12PMt1|CS14PMt1|CS15PMt1")) %>%
+  rename_with(~ str_replace_all(.x, replacements)) 
+
+
+
+#If SI columsn are all zero, fill in zeroes for Suicide Behavior columns 
+cond_cols   <- c('CS01_1mo_t1_R',
+                 'CS03_1mo_t1_R',
+                 'CS05_1mo_t1_R',
+                 'CS07_1mo_t1_R',
+                 'CS08_1mo_t1_R')
+
+target_cols <- c('CS12_1mo_t1',
+                 'CS14_1mo_t1',
+                 'CS15_1mo_t1')
+
+
+df_cssr_t1 <- df_cssr_t1 %>%
+  mutate(across(
+    all_of(target_cols),
+    ~ if_else(rowSums(across(all_of(cond_cols))) == 0, 0, .)
+  ))
+
+
+
+
+```
+
+
+```{r}
+
+df_select <- df_select %>%
+  filter(PtID %in% subject_list$subject) %>%
+  select(
+    PtID,
+    PtCond,
+    PtStatus,
+    matches("DEMGB001$|DEMGB002|CS01|CS03|CS05|CS07|CS08|CS12|CS23|CS24|CS25|CS34|^S016|^S017|^S018"),
+    -matches("LT"),
+    CS24LTt1,
+    CS25LTt1
+  ) %>%
+  replace_with_na(replace = list(
+    DEMGB002 = c(999,888)))%>%
+   mutate(across(matches("S01"), ~ na_if(.x, 888))) %>%
+   mutate(across(matches("S01"), ~ na_if(.x, 999))) %>%
+   mutate(across(c(DEMGB001,
+                  DEMGB002),
+                factor))%>%
+  rename_with(~ str_replace_all(.x, replacements)) 
+
+
+
+
+
+```
+
+Outcomes at baseline
+```{r}
+
+df_select <- df_select %>%
+  rowwise() %>%
+  mutate(
+    outcome_t1 = case_when(
+      # Code suicide attempt behavior
+      any(c_across(c(
+        S018_CR_t1)) == 1) ~ "SA", # current episode SA (past 1 month)
+      
+      # Code suicide ideation behavior           
+      any(c_across(c(
+        CS01_1mo_t1, # wish to be dead (past 1 month)  
+        CS03_1mo_t1, # nonspecific active SI (past 1 month) 
+        CS05_1mo_t1, # active ideation w method w/o intent (past 1 month) 
+        CS07_1mo_t1, # active ideation with intent w/o plan (past 1 month) 
+        CS08_1mo_t1, #  active suicide ideation w plan and intent (past 1 month)
+        S016_CR_t1)) == 1) ~ "SI", # current episode SI (past 1 month)
+      
+      # Code everything else 0 
+      TRUE ~ "Control"
+    )
+  ) %>%
+  ungroup()
+  
+
+
+```
+
+
+Outcomes in 3 mo leading up to baseline
+```{r}
+
+df_select <- df_select %>%
+  rowwise() %>%
+  mutate(
+    # Code suicide attempt behavior including 3 mo prior to baseline
+    outcome_past3mo_t1 = case_when(
+      any(c_across(c(
+        CS23_3mo_t1, # actual attempts (past 3 month)
+        CS24_3mo_t1, # passive and actual attempts (past 3 month)
+        CS34_3mo_t1, # Suicidal behavior (past 3 month)
+        S018_CR_t1)) == 1) ~ "SA", # current episode SA (past 1 month)
+      
+      # Code suicide ideation behavior
+      any(c_across(c(
+        CS01_1mo_t1, # wish to be dead (past 1 month)  
+        CS03_1mo_t1, # nonspecific active SI (past 1 month) 
+        CS05_1mo_t1, # active ideation w method w/o intent (past 1 month) 
+        CS07_1mo_t1, # active ideation with intent w/o plan (past 1 month) 
+        CS08_1mo_t1, #  active suicide ideation w plan and intent (past 1 month)
+        S016_CR_t1)) == 1) ~ "SI", # current episode SI (past 1 month)
+      
+      # Code everything else 0   
+      TRUE ~ 'Control' 
+    )
+  ) %>%
+  ungroup()
+
+
+```
+
+
+
+Outcomes bt baseline and 6 mo follow up
+```{r}
+df_select <- df_select %>%
+  rowwise() %>%
+  mutate(
+    outcome_t3 = case_when(
+      
+      # Code suicide attempt behavior since baseline if any of these variables = 1
+      any(c_across(c(
+        CS23_LA_t2, # actual attempts (since last appt)
+        CS23_LA_t3, # actual attempts (since last appt) 
+        
+        CS24_LA_t2, # passive and actual attempts (since last appt)
+        CS24_LA_t3, # passive and actual attempts (since last appt)
+        
+        CS34_LA_t2, #suicidal behavior (since last appt)
+        CS34_LA_t3, # suicidal behavior (since last appt)
+        
+        S018_CR_t2,  # current episode SA (since last appt)
+        S018_CR_t3)) == 1) ~ "SA",  # current episode SA (since last appt)
+      
+      # Code suicide ideation behavior since baseline           
+      any(c_across(c(
+        CS01_LA_t2, # wish to be dead (since last appt)
+        CS01_LA_t3, # wish to be dead (since last appt)
+        
+        CS03_LA_t2, # nonspecific active SI (since last appt)
+        CS03_LA_t3, # nonspecific active SI (since last appt)
+        
+        CS05_LA_t2, # active ideation w method w/o intent (since last appt)
+        CS05_LA_t3, # active ideation w method w/o intent (since last appt)
+        
+        CS07_LA_t2, # active ideation with intent w/o plan (since last appt)
+        CS07_LA_t3, # active ideation with intent w/o plan (since last appt)
+        
+        CS08_LA_t2, #  active suicide ideation w plan and intent (since last appt)
+        CS08_LA_t3, #  active suicide ideation w plan and intent (since last appt)
+        
+        S016_CR_t2, # current episode SI (since last appt)
+        S016_CR_t3)) == 1) ~ "SI", # current episode SI (since last appt)
+      
+      # Code everything else 0 
+      TRUE ~ "Control"
+    )
+  ) %>%
+  ungroup()
+
+
+
+```
+
+
+
+
+Outcomes bt baseline and 3 week follow up
+```{r}
+df_select <- df_select %>%
+  rowwise() %>%
+  mutate(
+    outcome_t2 = case_when(
+      
+      # Code suicide attempt behavior since baseline if any of these variables = 1
+      any(c_across(c(
+        CS23_LA_t2, # actual attempts (since last appt)
+        CS24_LA_t2, # passive and actual attempts (since last appt)
+        CS34_LA_t2, #suicidal behavior (since last appt)
+        S018_CR_t2)) == 1) ~ "SA",  # current episode SA (since last appt)
+      
+      # Code suicide ideation behavior since baseline           
+      any(c_across(c(
+        CS01_LA_t2, # wish to be dead (since last appt)
+        CS03_LA_t2, # nonspecific active SI (since last appt)
+        CS05_LA_t2, # active ideation w method w/o intent (since last appt)
+        CS07_LA_t2, # active ideation with intent w/o plan (since last appt)
+        CS08_LA_t2, #  active suicide ideation w plan and intent (since last appt)
+        S016_CR_t2)) == 1) ~ "SI", # current episode SI (since last appt)
+      
+      # Code everything else 0 
+      TRUE ~ "Control"
+    )
+  ) %>%
+  ungroup()
+
+
+
+```
+
+
+Select columns with outcome data only
+```{r}
+
+df_outcomes = df_select %>%
+  select(PtID, 
+         PtCond, 
+         DEMGB001,
+         DEMGB002, 
+         CS24_LT_t1, 
+         CS25_LT_t1,
+         outcome_t1,
+         outcome_past3mo_t1,
+         outcome_t2,
+         outcome_t3) %>%
+  rename('ParticipantName' = 'PtID')
+
+
+
+```
+
+
+Read all subjects' outcome group
+```{r}
+
+outcomes_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'BEST clean merged 190419.xlsx'
+
+#Takes a moment to connect to Box API
+temp_file = read_box_file(outcomes_path,filename)
+
+# Read in data
+outcomes_original_df = read_xlsx(temp_file) %>% distinct(ParticipantName, .keep_all = TRUE) %>% select (ParticipantName,Group) 
+
+
+
+```
+
+
+Merge outcome group
+```{r}
+df_outcomes_6mo = merge(df_outcomes, outcomes_original_df,by = 'ParticipantName',all.y = TRUE) %>% 
+  select(-PtCond) 
+
+subject_include = subject_list %>% filter(`Include?` == 'Y')
+
+df_outcomes_6mo = df_outcomes_6mo[(df_outcomes_6mo$ParticipantName %in% subject_include$subject),] 
+  
+```
+
+
+```{r}
+
+write_box_file(df_outcomes_6mo,eyetracking_cleaned_folder_id, 'outcomes_data_calculated_2.15.26.xlsx')
+write_box_file(df_cssr_t1,eyetracking_cleaned_folder_id, 'cssrs_t1_2.7.26.xlsx')
+
+
+```
+
+
+Key
+```{r}
+# Y = 1 N = 2
+
+#DEMOGB001 - Age
+
+
+
+
+## ===== Baseline =====
+
+# # SI variables
+# S016CRt1 - current episode SI
+# S017CRt1 - current episode plan
+# S018CRt1 - current episode SA
+
+
+# CS01PMt1 - wish to be dead past month  
+# CS03PMt1 - nonspecific active SI past month 
+# CS05PMt1 - active ideation w method w/o intent past month 
+# CS07PMt1 - active ideation with intent w/o plan past month 
+# CS08PMt1 - active suicide ideation w plan and intent past month 
+# CS012PMt1 - most severe SI past month 
+# CS013PMt1 - Descriptor past month 
+
+# CS01TMt1 - wish to be dead past 3 month  
+# CS03TMt1 - nonspecific active SI  past 3 month 
+# CS05TMt1 - active ideation w method w/o intent  past 3 month 
+# CS07TMt1 - active ideation with intent w/o plan  past 3 month 
+# CS08TMt1 - active suicide ideation w plan and intent  past 3 month 
+# CS012TMt1 - most severe SI  past 3 month 
+# CS013TMt1 - Descriptor  past 3 month 
+
+# # SA variables
+#CS23PMt1 - actual attempts past month
+#CS24PMt1 - passive and actual attempts past month
+
+#CS23TMt1 - actual attempts past 3 month
+#CS24TMt1 - passive and actual attempts past 3 month
+
+#CS34TMt1 - suicidal behavior past 3 mo
+
+
+## ===== 3 week follow up  =====
+
+# # SI variables
+# CS01LAt2 - wish to be dead since last appt  
+# CS03LAt2 - nonspecific active SI since last appt 
+# CS05LAt2 - active ideation w method w/o intent since last appt
+# CS07LAt2 - active ideation with intent w/o plan since last appt 
+# CS08LAt2 - active suicide ideation w plan and intent since last appt
+# CS012LAt2 - most severe SI since last appt 
+# CS013LAt2 - Descriptor since last appt
+
+
+# CS01PMt2 - wish to be dead past month  
+# CS03PMt2 - nonspecific active SI past month 
+# CS05PMt2 - active ideation w method w/o intent past month 
+# CS07PMt2 - active ideation with intent w/o plan past month 
+# CS08PMt2 - active suicide ideation w plan and intent past month 
+# CS012PMt2 - most severe SI past month 
+# CS013PMt2 - Descriptor past month 
+
+# CS01TMt2 - wish to be dead past 3 month  
+# CS03TMt2 - nonspecific active SI  past 3 month 
+# CS05TMt2 - active ideation w method w/o intent  past 3 month 
+# CS07TMt2 - active ideation with intent w/o plan  past 3 month 
+# CS08TMt2 - active suicide ideation w plan and intent  past 3 month 
+# CS012TMt2 - most severe SI  past 3 month 
+# CS013TMt2 - Descriptor  past 3 month 
+
+# # SA variables
+#CS23LAt2 - actual attempts since last appt
+#CS24LAt2 - passive and actual attempts since last appt
+#CS34LAt2 - suicidal behavior since last appt
+
+#CS23PMt2 - actual attempts past 3 month
+#CS24PMt2 - passive and actual attempts past 3 month
+
+#CS23TMt2 - actual attempts past 3 month
+#CS24TMt2 - passive and actual attempts past 3 month
+
+
+
+
+## ===== 6 mo follow up  =====
+
+# # SI variables
+# CS01LAt3 - wish to be dead since last appt  
+# CS03LAt3 - nonspecific active SI since last appt 
+# CS05LAt3 - active ideation w method w/o intent since last appt
+# CS07LAt3 - active ideation with intent w/o plan since last appt 
+# CS08LAt3 - active suicide ideation w plan and intent since last appt
+# CS012LAt3 - most severe SI since last appt 
+# CS013LAt3 - Descriptor since last appt
+
+
+# CS01PMt3 - wish to be dead past month  
+# CS03PMt3 - nonspecific active SI past month 
+# CS05PMt3 - active ideation w method w/o intent past month 
+# CS07PMt3 - active ideation with intent w/o plan past month 
+# CS08PMt3 - active suicide ideation w plan and intent past month 
+# CS012PMt3 - most severe SI past month 
+# CS013PMt3 - Descriptor past month 
+
+# CS01TMt3 - wish to be dead past 3 month  
+# CS03TMt3 - nonspecific active SI  past 3 month 
+# CS05TMt3 - active ideation w method w/o intent  past 3 month 
+# CS07TMt3 - active ideation with intent w/o plan  past 3 month 
+# CS08TMt3 - active suicide ideation w plan and intent  past 3 month 
+# CS012TMt3 - most severe SI  past 3 month 
+# CS013TMt3 - Descriptor  past 3 month 
+
+# # SA variables
+#CS23LAt3 - actual attempts since last appt
+#CS24LAt3 - passive and actual attempts since last appt
+#CS34LAt3 - suicidal behavior since last appt
+
+#CS23PMt3 - actual attempts past 3 month
+#CS24PMt3 - passive and actual attempts past 3 month
+
+#CS23TMt3 - actual attempts past 3 month
+#CS24TMt3 - passive and actual attempts past 3 month
+
+```
