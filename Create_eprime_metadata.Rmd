@@ -1,0 +1,353 @@
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+library(httr)
+library(jsonlite)
+
+library(boxr)
+library(openxlsx)
+
+
+#Functions to read and write from Box
+source('Read_Box_Functions.R')
+
+```
+
+
+
+Box API Tokens - Update these areas with token and desired output path
+```{r}
+# Generate token 
+# Configuration Link: https://carene.app.box.com/developers/console/app/2431769/configuration
+
+box_token <- '587PRQA0KvqYjWbM9AZUR5MgGryoPlf0'
+auth_header <- add_headers(Authorization = paste("Bearer", box_token))
+
+
+# Assign desired output path 
+# Navigate to output folder and copy id in the URL (ex. https://carene.app.box.com/folder/342486719038)
+baseline_processed_folder_id = '348165844236'
+eyetracking_cleaned_folder_id = '342468940685' 
+
+```
+
+
+
+
+
+
+
+
+Identify subjects to include
+```{r}
+# # Read in all subject files
+input_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned/Baseline_unprocessed'
+
+files = read_box_folder(input_path)$name
+
+```
+
+
+Create new eprime data based on StudioEventIndex 
+```{r}
+
+meta_data = data.frame()
+
+for(f in files[1]){
+  
+  temp_file = read_box_file(input_path,f)
+  
+  # Read in data
+  suppressWarnings({subject_data = read_xlsx(temp_file)})
+  
+  # Parse subject ID from file name
+  subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]]
+  
+  # Pull Event Markers and overwrite ParticipantName
+  temp = subject_data[!is.na(subject_data$StudioEventIndex),] %>% 
+           select(ParticipantName, StudioEventIndex, StudioEvent, RecordingTimestamp) %>%
+           mutate(ParticipantName = subject_name)
+  
+  meta_data = rbind(meta_data, temp)
+  
+  print(paste('Completed Subject',subject_name))  
+}
+
+
+#Start of trial indicated by c(...) numbers
+starts <- meta_data %>%
+  filter(StudioEventIndex %in% c(4,8,12,16,20,24,28,32,36,40,44,48)) %>%
+  group_by(ParticipantName) %>%
+  mutate(Trial = row_number()) %>%
+  select(ParticipantName, Trial, Trial_start = RecordingTimestamp)
+
+#End of trial indicated by c(...) numbers
+ends <- meta_data %>%
+  filter(StudioEventIndex %in% c(5,9,13,17,21,25,29,33,37,41,45,49)) %>%
+  group_by(ParticipantName) %>%
+  mutate(Trial = row_number()) %>%
+  select(ParticipantName, Trial, Trial_end = RecordingTimestamp)
+
+
+eprime_new <- full_join(starts, ends, by = c("ParticipantName", "Trial")) %>%
+  arrange(ParticipantName, Trial) %>%
+  mutate(Trial_duration = Trial_end - Trial_start)
+
+
+eprime_new$ParticipantName = as.numeric(eprime_new$ParticipantName)
+
+```
+
+
+
+Merge eprime trial times with UST-BEST eprime and gaze data--E-Prime Data_MASTER stimuli positioning 
+```{r}
+# Read in UST-BEST eprime and gaze data--E-Prime Data_MASTER.xlsx (old image edata)
+
+old_edata_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'UST-BEST eprime and gaze data--E-Prime Data_MASTER.xlsx'
+
+#Takes a moment to connect to Box API
+temp_file = read_box_file(old_edata_path,filename)
+
+old_edata = read_xlsx(temp_file,sheet = "FreeView") %>% 
+  select(Subject, SubTrial, Session,ExperimentVersion, BLImage,BRImage,ULImage,URImage,BLLabel,BRLabel,ULLabel,URLabel) %>%
+  filter(Session == 1)
+
+
+
+old_edata$Subject= as.numeric(old_edata$Subject)
+
+eprime_metadata <- merge(
+  eprime_new, old_edata,
+  by.x = c("ParticipantName", "Trial"),
+  by.y = c("Subject", "SubTrial"),
+  all.x = TRUE  # keeps all eprime rows even if no match in old_edata
+)
+```
+
+
+
+
+```{r}
+outcomes_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'BEST clean merged 190419.xlsx'
+
+#Takes a moment to connect to Box API
+temp_file = read_box_file(outcomes_path,filename)
+
+# Read in data
+outcomes = read_xlsx(temp_file) %>% distinct(ParticipantName, .keep_all = TRUE) %>% select (ParticipantName,Group) 
+
+outcomes$ParticipantName = as.numeric(outcomes$ParticipantName)
+
+outcomes_edata <- eprime_metadata %>%
+  left_join(outcomes , by = ("ParticipantName"))
+
+```
+
+
+
+Create Meta data overview including trial duration and trial percent valid
+
+```{r}
+
+meta_data_overview <- data.frame()
+
+for(f in files[1]){
+  
+  temp_file = read_box_file(input_path,f)
+  
+  # Read in data
+  suppressWarnings({subject_data = read_xlsx(temp_file)})
+  subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]]
+  
+  #if(subject_name %in% include_subjects){
+  
+    subject_image_edata = outcomes_edata[which(outcomes_edata$ParticipantName == as.integer(subject_name)),]
+    
+# ==== Calculating trial length ====
+
+    ## Indicate current time 
+    subject_data$full_datetime = strptime(
+      paste(subject_data$RecordingDate, subject_data$LocalTimeStamp),
+      format = "%m/%d/%Y %H:%M:%OS"
+    )
+
+    subject_data$trial = NA_integer_
+    
+    ## Match Stimulus Onset with closest elapsed ms since start of experiment
+    for(trial in 1:nrow(subject_image_edata)){ 
+      
+      trial_start_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_start[trial]))
+      
+      trim_trial_start_time = subject_data$RecordingTimestamp[trial_start_time] + 500
+      
+      # ## Data Check: Timing match up
+      # # Print time diff bt Edata Stimulus Start time & closest ms from experiment
+      # print(paste('Trial',trial,' Start Time Difference:',subject_image_edata$Trial_start[trial]- subject_data$RecordingTimestamp[trial_start_time],'ms'))
+
+
+    trial_end_time = which.min(
+          abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_end[trial])) 
+    
+    trim_trial_end_time = subject_data$RecordingTimestamp[trial_end_time] - 500
+    
+        # ## Data Check: Timing match up
+        # Print start of fixation of next trial to mark end time
+        # print(paste('Trial',trial,'through', trial + 1,' Difference:', subject_image_edata$Trial_end[trial] - subject_data$RecordingTimestamp[trial_end_time],'ms'))
+      
+      
+  # ==== Assign trial only within trimmed window ====
+      subject_data$trial[
+        subject_data$RecordingTimestamp >= trim_trial_start_time &
+          subject_data$RecordingTimestamp <= trim_trial_end_time
+      ] <- trial
+    }
+    
+    # ==== Compute trial durations ====
+    subject_data_full = subject_data
+    
+    
+    # Remove NA data
+    subject_data = subject_data[complete.cases(subject_data$trial), ]
+    
+    
+    # ==== Trial percent valid in wide format ====
+    trial_percent_valid <- subject_data %>%
+      group_by(trial) %>%
+      reframe(
+        percent_trial_valid = if(n() > 0) {
+          100 * sum(ValidityLeft == 0 & ValidityRight == 0, na.rm = TRUE) / n()
+        } else {
+          NA_real_
+        }
+      ) %>%
+      mutate(trial = paste0("trial_", trial)) %>%
+      tidyr::pivot_wider(names_from = trial, values_from = percent_trial_valid)
+    
+    
+    # Ensure all 12 trial columns exist
+    all_trials <- paste0("trial_", 1:12)
+    missing_trials <- setdiff(all_trials, colnames(trial_percent_valid))
+    
+    for(mt in missing_trials) trial_percent_valid[[mt]] <- NA
+    
+    trial_percent_valid <- trial_percent_valid[, c("trial_1", "trial_2", "trial_3", "trial_4", "trial_5", "trial_6", "trial_7", "trial_8", "trial_9", "trial_10", "trial_11", "trial_12")]
+    trial_percent_valid$subject <- subject_name
+    
+
+  
+
+    percent_valid= sum(subject_data$ValidityLeft ==0 & subject_data$ValidityRight ==0, na.rm=TRUE)/ nrow(subject_data)*100
+    
+    
+    
+       # ==== Trial durations in wide format ====
+    trial_durations <- subject_data %>%
+      group_by(trial) %>%
+      reframe(
+        trial_duration = if(n() > 0) {
+          as.numeric(difftime(max(full_datetime), min(full_datetime), units = "secs"))
+        } else {
+          NA_real_
+        }
+      ) %>%
+      mutate(trial = paste0("trial_", trial)) %>%
+      tidyr::pivot_wider(names_from = trial, values_from = trial_duration)
+    
+    
+    # Ensure all 12 trial columns exist
+    all_trials <- paste0("trial_", 1:12)
+    missing_trials <- setdiff(all_trials, colnames(trial_durations))
+    
+    for(mt in missing_trials) trial_durations[[mt]] <- NA
+    
+    trial_durations <- trial_durations[, c("trial_1", "trial_2", "trial_3", "trial_4", "trial_5", "trial_6", "trial_7", "trial_8", "trial_9", "trial_10", "trial_11", "trial_12")]
+    trial_durations$subject <- subject_name
+    
+    
+    subject_data <- subject_data[(subject_data$ValidityLeft == 0 & subject_data$ValidityRight == 0),]
+    
+    subject_data <- subject_data[!is.na(subject_data$ParticipantName), ]
+    
+    # trials_kept <- length(unique(na.omit(subject_data$trial)))
+  
+    
+    # ==== Subject metadata ====
+    subject_meta_data_row <- data.frame(
+      subject = subject_name,
+      edata_existing = nrow(subject_image_edata),
+      full_max_elapsed_time = ifelse(all(is.na(subject_data_full$RecordingDuration)), NA,
+                                     max(subject_data_full$RecordingDuration, na.rm = TRUE)),
+      
+      max_elapsed_time = ifelse(all(is.na(subject_data$RecordingTimestamp)), NA,
+                                max(subject_data$RecordingTimestamp, na.rm = TRUE)),
+      
+      max_edata_time = ifelse(all(is.na(subject_image_edata$Trial_end)), NA,
+                              max(subject_image_edata$Trial_end, na.rm = TRUE)),
+      percent_Valid = percent_valid
+    )
+    
+    # Merge metadata + trial durations + trials percent valid
+    #subject_meta_data_row <- dplyr::left_join(subject_meta_data_row, trial_durations, by = "subject")
+    
+    subject_meta_data_row <- left_join(subject_meta_data_row, trial_durations, by = "subject")
+    
+    subject_meta_data_row <- left_join(subject_meta_data_row, trial_percent_valid, by = "subject")
+    
+    # Append to overview
+    #meta_data_overview <- dplyr::bind_rows(meta_data_overview, subject_meta_data_row)
+    meta_data_overview <- bind_rows(meta_data_overview, subject_meta_data_row)
+   
+    print(paste('Completed Subject', subject_name))
+     
+ # }
+}
+
+
+```
+
+```{r}
+
+# write.xlsx(meta_data_overview,'inclusion_decisions_meta_data9.29.25.xlsx')
+```
+
+
+
+Merge exclusion notes
+```{r}
+
+# # Read excluded list
+exclude_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'Exclude_list.xlsx'
+temp_file = read_box_file(exclude_path,filename)
+
+# # # Read in excluded subjects list
+exclude_list = read_xlsx(temp_file)
+
+exclude_list$`Participant #` <- as.character(exclude_list$`Participant #`)
+
+# exclude_subjects <- exclude_list$`Participant #`[exclude_list$`Include?` == "N" |exclude_list$`Include?` == "M" ]
+
+
+meta_data_overview <- merge(
+  exclude_list,
+  meta_data_overview,
+  by.x = ("Participant #"),
+  by.y = ("subject"),
+  all.y = TRUE  # keeps all eprime rows even if no match in exclude list
+)
+
+```
+
+
+```{r}
+
+#write.xlsx(meta_data_overview, 'inclusion_decisions.xlsx')
+
+```
