@@ -1,0 +1,1321 @@
+
+To do
+- Label all fixations (NA's included)
+- Don't remove incompletes
+- Dummy code invalid calibrations, trial lengths, etc 
+- Code nsteps 
+- Dont remove first/ last 500ms 
+- 
+
+```{r}
+# install.packages('readxl')
+# install.packages('dplyr')
+```
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+library(ggplot2)
+library(gganimate)
+
+library(httr)
+library(jsonlite)
+
+library(boxr)
+library(openxlsx)
+
+library(car)
+library(permute)
+library(coin)
+library(zoo)
+```
+
+Box API Tokens - Update these areas with token and desired output path
+```{r}
+# Generate token 
+# Configuration Link: https://carene.app.box.com/developers/console/app/2431769/configuration
+
+box_token <- 'OKxMs4CzOIQaItsypFAU8xT2PYgqpmiI'
+auth_header <- add_headers(Authorization = paste("Bearer", box_token))
+
+
+# Assign desired output path 
+# Navigate to output folder and copy id in the URL (ex. https://carene.app.box.com/folder/342486719038)
+baseline_minimally_processed_folder_id = '368413816407' 
+```
+
+
+
+Functions to read and write from Box
+```{r}
+
+source('Read_Box_Functions.R')
+
+```
+
+
+Screen mock up 
+```{r}
+screen_height = 1080
+screen_width = 1920
+
+#Resize initial stimuli dimensions (768x1024)
+image_height = screen_height *.35
+image_width = screen_width*.35
+
+height_padding = (screen_height*.07)
+width_padding = (screen_width *.07)
+
+screen = matrix(0, screen_height, screen_width)
+
+# Top Left picture
+screen[(1:image_height)+height_padding,(1:image_width)+width_padding] = 1
+
+# Top Right picture
+screen[(1:image_height)+height_padding, ((screen_width-image_width +1):screen_width)-width_padding] = 2
+
+# Bottom Left picture 
+screen[((screen_height-image_height+1):screen_height)-height_padding,(1:image_width)+width_padding] = 3
+
+# Bottom right picture 
+screen[((screen_height-image_height+1):screen_height)-height_padding, ((screen_width-image_width +1):screen_width)-width_padding] = 4
+
+#table(screen)
+#
+# # Plot it
+# image(
+#   t(apply(screen, 2, rev)),        # rotate so it looks natural
+#   col = c("black", "red", "blue","forestgreen","gold"), # 0=black, 1=red, 2=blue, 3 = green, 4 = yellow
+#   axes = FALSE
+# )
+
+```
+
+
+
+Read in image edata
+```{r}
+
+edata_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'eprime_Freeview_Meta_Data_9.28.25.xlsx'
+
+#Takes a moment to connect to Box API
+temp_file = read_box_file(edata_path,filename)
+
+edata = read_xlsx(temp_file)
+
+edata$ParticipantName = as.numeric(edata$ParticipantName)
+
+
+```
+
+Read in outcomes data
+```{r}
+
+outcomes_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+#filename = 'BEST clean merged 190419.xlsx'
+filename = 'outcomes_data_calculated_2.15.26.xlsx'
+
+#Takes a moment to connect to Box API
+temp_file = read_box_file(outcomes_path,filename)
+
+# Read in data
+outcomes = read_xlsx(temp_file) #%>% rename('ParticipantName' = 'PtID')
+
+# outcomes = read_xlsx(temp_file) %>% distinct(ParticipantName, .keep_all = TRUE) %>% select (ParticipantName,Group) 
+
+outcomes_edata<- edata %>%
+  left_join(outcomes , by = ("ParticipantName"))
+
+
+
+```
+
+
+Identify subjects to include
+```{r}
+# Read in all subject files
+input_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned/Baseline_unprocessed'
+
+files = read_box_folder(input_path)$name
+
+# Get subject ID numbers
+subject_list <- c()
+
+for (f in files) {
+  subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]]
+  subject_list <- rbind(subject_list, subject_name)
+}
+
+# Get unique subjects
+subject_list <- unique(subject_list)
+
+
+## Read excluded list
+exclude_path = 'Freeview 2025/files from BEST folder/Data (from BEST_project on server)/Eyetracking Cleaned'
+filename = 'inclusion_decisions_EventMarker_meta_data_9.29.25.xlsx'
+
+temp_file = read_box_file(exclude_path,filename)
+
+## Read in excluded subjects list
+exclude_list = read_xlsx(temp_file)
+
+exclude_subjects <- exclude_list$subject[exclude_list$`Include?` == "N" ]
+
+#include_subjects <- exclude_list$subject[exclude_list$`Include?` == "Y"]
+
+include_subjects <- subject_list[!(subject_list %in% exclude_subjects)]
+
+```
+
+
+
+Data cleaning 
+```{r}
+summary_statistics = data.frame()
+
+# for(f in files[216:length(files)]){
+for(f in files){
+  
+  
+  temp_file = read_box_file(input_path,f)
+  
+  # Read in data
+  suppressWarnings({subject_data = read_xlsx(temp_file)})
+  subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]]
+  
+  #Corrections to some subject names 
+  correct_subject_ids = c(129, 346, 372)
+  if(subject_name %in% correct_subject_ids){
+    subject_data$ParticipantName <- subject_name
+  } 
+  
+  
+  if(subject_name %in% include_subjects){
+    
+    ## Pull meta data for subject
+    subject_image_edata = outcomes_edata[which(outcomes_edata$ParticipantName == as.integer(subject_name)),]
+    
+    # ==== Calculating trial length ====
+    
+    ## Indicate current time 
+    subject_data$full_datetime = strptime(
+      paste(subject_data$RecordingDate, subject_data$LocalTimeStamp),
+      format = "%m/%d/%Y %H:%M:%OS"
+    )
+    
+    ## Calculate difference between current experiment time and start time
+    subject_data$trial = NA_integer_
+    
+    ## Match trial start/end time with closest timestamp index
+    for(trial in 1:nrow(subject_image_edata)){ 
+      
+      trial_start_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_start[trial]))
+      
+      trim_trial_start_time = subject_data$RecordingTimestamp[trial_start_time] #+ 500 # Allow for first 500ms
+      
+      trial_end_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_end[trial])) 
+      
+      trim_trial_end_time = subject_data$RecordingTimestamp[trial_end_time] #- 500 # Allow for last 500ms
+      
+      ## Assign trial only within trimmed window
+      subject_data$trial[
+        subject_data$RecordingTimestamp > trim_trial_start_time &
+          subject_data$RecordingTimestamp < trim_trial_end_time
+      ] <- trial
+    }
+    
+    # Save copy of full data before cleaning invalid data
+    subject_data_full = subject_data
+    #subject_data = subject_data_full
+    
+    
+    # Remove duplicate time stamps if any
+    subject_data = subject_data[!duplicated(subject_data$RecordingTimestamp),]    
+    
+    
+    # Calculate trial duration (keep all durations) 
+    subject_data <- subject_data %>%
+      group_by(trial) %>%
+      mutate(trial_duration = as.numeric(difftime(max(full_datetime), min(full_datetime), units = "secs"))) %>%
+      ungroup() 
+    
+    
+    # ==== Flagging invalid calibrations ==== 
+    
+    # Define trial duration and percent of trial with valid calibrations in right and left eyes
+    trial_percent_valid <- subject_data %>%
+      group_by(trial) %>%
+      summarize(
+        percent_trial_valid = 100 * sum(ValidityLeft == 0 & ValidityRight == 0, na.rm = TRUE) / n(),
+        trial_duration = as.numeric(difftime(max(full_datetime),min(full_datetime), units = "secs")),
+        .groups = "drop")
+    
+    trial_percent_valid = trial_percent_valid[complete.cases(trial_percent_valid),]
+    
+    # Define outlier durations as invalid (1sd above the mean )
+    duration_mean_1sd <- mean(trial_percent_valid$trial_duration, na.rm = TRUE) + 
+      sd(trial_percent_valid$trial_duration, na.rm = TRUE)
+    
+    valid_trials <-   trial_percent_valid %>%
+      filter(
+        percent_trial_valid >= 80,
+        trial_duration < duration_mean_1sd,
+        !is.na(trial)
+      ) %>%
+      pull(trial)
+    
+    
+    ## Not using in minimally processed: Filter subject_data to include only valid trials
+    # subject_data <- subject_data %>%
+    #   filter(trial %in% valid_trials)
+    
+    
+    # Create column to indicate valid trials (valid trial = 1, invalid trial = 0)
+    subject_data <- subject_data %>%
+      mutate(trial_valid = case_when(
+        trial %in% valid_trials~1,
+        TRUE ~ 0 ))
+    
+    
+    cat("Trials Kept:", paste(valid_trials, collapse = " "), "\n")
+    
+    trials_kept = length(valid_trials) 
+    
+    
+    ## Calculate fixation milliseconds
+    subject_data <- subject_data %>%
+      group_by(trial) %>% 
+      mutate(
+        FixationDuration = if_else(
+          trial_valid == 1,
+          (lead(RecordingTimestamp) - RecordingTimestamp) / 1000,
+          NA_real_
+        )
+      ) %>%
+      ungroup() 
+    
+    subject_data<- subject_data %>%
+      group_by(trial)%>%
+      mutate(
+        n_steps = RecordingTimestamp - min(RecordingTimestamp),
+        n_steps_by_row = row_number()
+      )
+    
+    # ==== Remove invalid data points ====
+    
+    # Remove non-trial data (fixation crosses, etc)
+    subject_data <- subject_data %>%
+      filter(!is.na(trial))
+    # | !is.na(StudioEventIndex)
+    
+    # Create column to indicate  subject_data with valid calibrations (valid cal = 1, invalid cal= 0)
+    subject_data <- subject_data %>%
+      mutate(calibration_valid = case_when(
+        (ValidityLeft == 0 & ValidityRight == 0)~1,
+        TRUE ~ 0))
+    
+  
+    # Cap trial duration (valid length = 1, invalid length = 0)
+    subject_data <- subject_data %>% 
+      group_by(trial)%>%
+      mutate(trial_length_valid = case_when(
+        n_steps <=30000~1,
+        TRUE ~0
+      ))
+    
+    
+    ## Not using in minimally processed : remove non valid eye calibrations
+    #subject_data = subject_data[((subject_data$ValidityLeft) == 0 & (subject_data$ValidityRight ==0)),]
+    #subject_data = subject_data[!is.na(subject_data$ParticipantName), ]
+    
+    
+    # ==== Smoothing, Flagging by Trial ===
+    
+    # Convert to numeric
+    subject_data$`GazePointY (MCSpx)`= as.numeric(subject_data$`GazePointY (MCSpx)`)
+    subject_data$`GazePointX (MCSpx)`= as.numeric(subject_data$`GazePointX (MCSpx)`)
+    
+    window_size <- 5  # number of neighbors
+    
+    subject_data <- subject_data %>%
+      group_by(trial) %>%
+      mutate(
+        
+        # Check if the current trial is in our 'valid' list
+        is_valid = trial %in% valid_trials,
+        
+        # ==== Moving Average Smoothing ===
+        GazeX_smooth = if_else(is_valid, rollapply(`GazePointX (MCSpx)`,
+                                                   width=window_size, FUN=mean,
+                                                   na.rm=TRUE, fill=NA, align="center"), NA_real_),
+        
+        GazeY_smooth = if_else(is_valid, rollapply(`GazePointY (MCSpx)`,
+                                                   width=window_size, FUN=mean,
+                                                   na.rm=TRUE, fill=NA, align="center"), NA_real_),
+        
+        # ==== Identify spikes ====
+        # Calculate distance between and velocity of gaze points
+        vx = GazeX_smooth - lag(GazeX_smooth),
+        vy = GazeY_smooth - lag(GazeY_smooth),
+        dist = sqrt(vx^2 + vy^2),
+        dt = (RecordingTimestamp - lag(RecordingTimestamp)) / 1000,
+        vel = dist / dt,
+        
+        # Calculate distance/velocity threshold based on median absolute deviation
+        dist_threshold = if_else(is_valid, median(dist, na.rm=TRUE) + 2.5 * mad(dist, na.rm=TRUE), NA_real_),
+        
+        vel_threshold  = if_else(is_valid, median(vel, na.rm=TRUE) + 2.5 * mad(vel, na.rm=TRUE), NA_real_),
+        
+        # Flag spikes in distance and velocity
+        spike_flag = if_else(is_valid, (dist > dist_threshold) | (vel > vel_threshold), FALSE),
+        
+        GazeX_clean = if_else(is_valid & !spike_flag & GazeX_smooth >= 1, GazeX_smooth, NA_real_),
+        GazeY_clean = if_else(is_valid & !spike_flag & GazeY_smooth >= 1, GazeY_smooth, NA_real_),
+        
+        # ==== Interpolate gaze points ====
+        GazeX_clean = if_else(is_valid, as.numeric(na.approx(GazeX_clean, na.rm=FALSE)), NA_real_),
+        GazeY_clean = if_else(is_valid, as.numeric(na.approx(GazeY_clean, na.rm=FALSE)), NA_real_),
+        
+        # ==== Create Pupil Mean for valid gaze points ====
+        PupilMean = if_else(is_valid & !spike_flag, (PupilLeft + PupilRight) / 2, NA_real_),
+        
+        # ==== Interpolate Pupil Mean ====
+        PupilMean = if_else(is_valid, as.numeric(na.approx(PupilMean, na.rm=FALSE)), NA_real_)
+        
+      ) %>%
+      select(-is_valid) %>% # remove helper column
+      ungroup()
+    
+    
+    # ==== Coordinate gaze coordinates to screen position ====
+    
+    subject_data$Position = screen[cbind(subject_data$GazeY_clean, subject_data$GazeX_clean)]
+    
+    # NA out any Quadrant Position info that has a spike flag so we dont count these toward Fixation Count/ Dwell Time
+    subject_data$Position =
+      ifelse(subject_data$spike_flag == TRUE | subject_data$trial_valid == 0,
+             NA,
+             subject_data$Position)
+    
+    
+    #Create variable indicating invalid gazepoints based on spike flag, invalid calibrations, and excess trial length
+    subject_data <- subject_data %>%
+      mutate(gazepoint_valid = if_else(
+        coalesce(spike_flag, TRUE) ==TRUE | coalesce(calibration_valid, 0) ==0 | coalesce(trial_length_valid, 0)  == 0, 0, 1))
+    
+    
+  
+    
+    # ==== Coordinate image type with fixation position ====
+    
+    subject_image_edata_long <- subject_image_edata %>%
+      pivot_longer(
+        cols = c(ULLabel, URLabel, BLLabel, BRLabel),
+        names_to = "Quadrant",
+        values_to = "ImageType"
+      ) %>%
+      mutate(Position = case_when(
+        Quadrant == "ULLabel" ~ 1,
+        Quadrant == "URLabel" ~ 2,
+        Quadrant == "BLLabel" ~ 3,
+        Quadrant == "BRLabel" ~ 4
+      )) %>%
+      select(Trial, Position, ImageType)
+    
+    
+    
+    subject_data <- subject_data %>%
+      left_join(
+        subject_image_edata_long,
+        by = c("trial" = "Trial", "Position" = "Position")
+      )
+    
+    subject_data$ImageType[subject_data$Position == 0] <- "Background"
+    
+    
+    
+    # =========================== Save individual data files ================================
+        
+    # Remove unnecessary variables
+    subject_data_select <- subject_data %>% select(ParticipantName, StudioVersionRec, 
+                                                   FixationFilter, RecordingName, 
+                                                   RecordingResolution, RecordingDuration, 
+                                                   RecordingTimestamp, LocalTimeStamp, 
+                                                   #full_datetime,
+                                                   `GazePointX (MCSpx)`, `GazePointY (MCSpx)`, 
+                                                   PupilLeft, PupilRight, 
+                                                   ValidityLeft,ValidityRight,
+                                                   trial, trial_duration,
+                                                   FixationDuration, n_steps, n_steps_by_row,
+                                                   dist, vel,  
+                                                   GazeX_clean, GazeY_clean,
+                                                   PupilMean, Position,ImageType, spike_flag, 
+                                                   calibration_valid, 
+                                                   trial_length_valid,
+                                                   gazepoint_valid,trial_valid)
+  
+    
+    # Save cleaned data file to box
+    
+    subject_file_name = paste0(subject_name,'_freeview_t1_processed.xlsx')
+    
+    write_box_file(subject_data_select,baseline_minimally_processed_folder_id, subject_file_name)
+    
+    
+   # =========================== Save summary statistics  ================================
+    subject_data_unfiltered = subject_data # save a copy 
+    
+    subject_data = subject_data %>%
+      filter(gazepoint_valid == 1,
+             trial_valid ==1)
+  
+    
+    
+    # ==== Compute fixation time per trial × image type ====
+    fixation_by_trial <- subject_data %>%
+      group_by(trial, ImageType) %>%
+      summarise(
+        total_fixation_time = sum(FixationDuration, na.rm = TRUE),
+        fixation_count = sum(!is.na(FixationDuration)),
+        pupil_size = mean(PupilMean,na.rm=TRUE),
+        .groups = "drop"
+      )
+    
+    
+    ## Include rows with Image Type info
+    fixation_by_trial =  fixation_by_trial[complete.cases(fixation_by_trial$ImageType),]
+    
+    ## Average fixation time across trials by image type
+    mean_fixation_by_type <- fixation_by_trial %>%
+      group_by(ImageType) %>%
+      summarise(
+        MeanFixationTimeByTrial = mean(total_fixation_time, na.rm = TRUE),
+        MeanFixationCountByTrial = mean(fixation_count, na.rm = TRUE),
+        MeanPupilByTrial = mean(pupil_size,na.rm=TRUE),
+        .groups = "drop")
+    
+    ## Convert to a wide format 
+    mean_fixation_wide <- mean_fixation_by_type %>%
+      pivot_wider(
+        names_from = ImageType,
+        values_from = c(MeanFixationTimeByTrial, MeanFixationCountByTrial,MeanPupilByTrial),
+        names_glue = "{ImageType}{.value}")
+    
+    
+    # ==== Save participant viewing statistics ====
+    
+    subject_row = data.frame(
+      subject = subject_name,
+      Group = subject_image_edata$Group[1],
+      TrialsKept = trials_kept,
+      # FixationFilter = subject_data$FixationFilter[1],
+      ExperimentVersion = edata$ExperimentVersion[1],
+      
+      SuicideFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Suicide"], na.rm = TRUE),
+      NeutralFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Neutral"], na.rm = TRUE),
+      SocialFixationTime    = sum(subject_data$FixationDuration[subject_data$ImageType == "Social"], na.rm = TRUE),
+      DysphoricFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Dysphoric"], na.rm = TRUE),
+      BackgroundFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Background"], na.rm = TRUE),
+      
+      SuicideFixationCount   = sum(subject_data$ImageType == "Suicide", na.rm = TRUE),
+      NeutralFixationCount   = sum(subject_data$ImageType == "Neutral", na.rm = TRUE),
+      SocialFixationCount    = sum(subject_data$ImageType == "Social", na.rm = TRUE),
+      DysphoricFixationCount = sum(subject_data$ImageType == "Dysphoric", na.rm = TRUE),
+      BackgroundFixationCount = sum(subject_data$ImageType == "Background", na.rm = TRUE),      
+      
+      SuicidePupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Suicide"], na.rm = TRUE),
+      NeutralPupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Neutral"], na.rm = TRUE),
+      SocialPupilSize    = mean(subject_data$PupilMean[subject_data$ImageType == "Social"], na.rm = TRUE),
+      DysphoricPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Dysphoric"], na.rm = TRUE),
+      BackgroundPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Background"], na.rm = TRUE)
+    )
+    
+    
+    ## Cbind fixation time/ count by trial info
+    subject_row= cbind(subject_row,mean_fixation_wide)
+    
+    summary_statistics = rbind(summary_statistics, subject_row)
+    
+    print(paste('Completed Subject',subject_name))
+    
+  } else {next}
+}
+
+# write_box_file(summary_statistics,baseline_minimally_processed_folder_id, 'summary_statistics_freeview_t1_processed.xlsx')
+
+
+```
+
+
+
+<!-- Data cleaning  - 2/28 works--> 
+<!-- ```{r} -->
+<!-- summary_statistics = data.frame() -->
+
+<!-- # for(f in files[216:length(files)]){ -->
+<!-- for(f in files){ -->
+
+
+<!--   temp_file = read_box_file(input_path,f) -->
+
+<!--   # Read in data -->
+<!--   suppressWarnings({subject_data = read_xlsx(temp_file)}) -->
+<!--   subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]] -->
+
+<!--   #Corrections to some subject names  -->
+<!--   correct_subject_ids = c(129, 346, 372) -->
+<!--   if(subject_name %in% correct_subject_ids){ -->
+<!--     subject_data$ParticipantName <- subject_name -->
+<!--   }  -->
+
+
+<!--   if(subject_name %in% include_subjects){ -->
+
+<!--     ## Pull meta data for subject -->
+<!--     subject_image_edata = outcomes_edata[which(outcomes_edata$ParticipantName == as.integer(subject_name)),] -->
+
+<!--     # ==== Calculating trial length ==== -->
+
+<!--     ## Indicate current time  -->
+<!--     subject_data$full_datetime = strptime( -->
+<!--       paste(subject_data$RecordingDate, subject_data$LocalTimeStamp), -->
+<!--       format = "%m/%d/%Y %H:%M:%OS" -->
+<!--     ) -->
+
+<!--     ## Calculate difference between current experiment time and start time -->
+<!--     subject_data$trial = NA_integer_ -->
+
+<!--     ## Match trial start/end time with closest timestamp index -->
+<!--     for(trial in 1:nrow(subject_image_edata)){  -->
+
+<!--       trial_start_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_start[trial])) -->
+
+<!--       trim_trial_start_time = subject_data$RecordingTimestamp[trial_start_time] #+ 500 # Allow for first 500ms -->
+
+<!--       trial_end_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_end[trial]))  -->
+
+<!--       trim_trial_end_time = subject_data$RecordingTimestamp[trial_end_time] #- 500 # Allow for last 500ms -->
+
+<!--       ## Assign trial only within trimmed window -->
+<!--       subject_data$trial[ -->
+<!--         subject_data$RecordingTimestamp > trim_trial_start_time & -->
+<!--           subject_data$RecordingTimestamp < trim_trial_end_time -->
+<!--       ] <- trial -->
+<!--     } -->
+
+<!--     # Save copy of full data before cleaning invalid data -->
+<!--     subject_data_full = subject_data -->
+<!--     #subject_data = subject_data_full -->
+
+
+<!--     # Remove duplicate time stamps if any -->
+<!--     subject_data = subject_data[!duplicated(subject_data$RecordingTimestamp),]     -->
+
+
+<!--     # Calculate trial duration (keep all durations)  -->
+<!--     subject_data <- subject_data %>% -->
+<!--       group_by(trial) %>% -->
+<!--       mutate(trial_duration = as.numeric(difftime(max(full_datetime), min(full_datetime), units = "secs"))) %>% -->
+<!--       ungroup()  -->
+
+
+<!--     # ==== Flagging invalid calibrations ====  -->
+
+<!--     # Define trial duration and percent of trial with valid calibrations in right and left eyes -->
+<!--     trial_percent_valid <- subject_data %>% -->
+<!--       group_by(trial) %>% -->
+<!--       summarize( -->
+<!--         percent_trial_valid = 100 * sum(ValidityLeft == 0 & ValidityRight == 0, na.rm = TRUE) / n(), -->
+<!--         trial_duration = as.numeric(difftime(max(full_datetime),min(full_datetime), units = "secs")), -->
+<!--         .groups = "drop") -->
+
+<!--     trial_percent_valid = trial_percent_valid[complete.cases(trial_percent_valid),] -->
+
+<!--     # Define outlier durations as invalid (1sd above the mean ) -->
+<!--     duration_mean_1sd <- mean(trial_percent_valid$trial_duration, na.rm = TRUE) +  -->
+<!--       sd(trial_percent_valid$trial_duration, na.rm = TRUE) -->
+
+<!--     valid_trials <-   trial_percent_valid %>% -->
+<!--       filter( -->
+<!--         percent_trial_valid >= 80, -->
+<!--         trial_duration < duration_mean_1sd, -->
+<!--         !is.na(trial) -->
+<!--       ) %>% -->
+<!--       pull(trial) -->
+
+
+<!--     ## Not using in minimally processed: Filter subject_data to include only valid trials -->
+<!--     # subject_data <- subject_data %>% -->
+<!--     #   filter(trial %in% valid_trials) -->
+
+
+<!--     # Create column to indicate valid trials (valid trial = 1, invalid trial = 0) -->
+<!--     subject_data <- subject_data %>% -->
+<!--       mutate(trial_valid = case_when( -->
+<!--         trial %in% valid_trials~1, -->
+<!--         TRUE ~ 0 )) -->
+
+
+<!--     cat("Trials Kept:", paste(valid_trials, collapse = " "), "\n") -->
+
+<!--     trials_kept = length(valid_trials)  -->
+
+
+<!--     ## Calculate fixation milliseconds -->
+<!--     subject_data <- subject_data %>% -->
+<!--       group_by(trial) %>%  -->
+<!--       mutate( -->
+<!--         FixationDuration = if_else( -->
+<!--           trial_valid == 1, -->
+<!--           (lead(RecordingTimestamp) - RecordingTimestamp) / 1000, -->
+<!--           NA_real_ -->
+<!--         ) -->
+<!--       ) %>% -->
+<!--       ungroup()  -->
+
+<!--     subject_data<- subject_data %>% -->
+<!--       group_by(trial)%>% -->
+<!--       mutate( -->
+<!--         n_steps = RecordingTimestamp - min(RecordingTimestamp), -->
+<!--         n_steps_by_row = row_number() -->
+<!--       ) -->
+
+<!--     # ==== Remove invalid data points ==== -->
+
+<!--     # Remove non-trial data (fixation crosses, etc) -->
+<!--     subject_data <- subject_data %>% -->
+<!--       filter(!is.na(trial)) -->
+<!--     # | !is.na(StudioEventIndex) -->
+
+<!--     # Create column to indicate  subject_data with valid calibrations (valid cal = 1, invalid cal= 0) -->
+<!--     subject_data <- subject_data %>% -->
+<!--       mutate(calibration_valid = case_when( -->
+<!--         (ValidityLeft == 0 & ValidityRight == 0)~1, -->
+<!--         TRUE ~ 0)) -->
+
+
+<!--     # Cap trial duration (valid length = 1, invalid length = 0) -->
+<!--     subject_data <- subject_data %>%  -->
+<!--       group_by(trial)%>% -->
+<!--       mutate(trial_length_valid = case_when( -->
+<!--         n_steps <=30000~1, -->
+<!--         TRUE ~0 -->
+<!--       )) -->
+
+
+<!--     ## Not using in minimally processed : remove non valid eye calibrations -->
+<!--     #subject_data = subject_data[((subject_data$ValidityLeft) == 0 & (subject_data$ValidityRight ==0)),] -->
+<!--     #subject_data = subject_data[!is.na(subject_data$ParticipantName), ] -->
+
+
+<!--     # ==== Smoothing, Flagging by Trial === -->
+
+<!--     # Convert to numeric -->
+<!--     subject_data$`GazePointY (MCSpx)`= as.numeric(subject_data$`GazePointY (MCSpx)`) -->
+<!--     subject_data$`GazePointX (MCSpx)`= as.numeric(subject_data$`GazePointX (MCSpx)`) -->
+
+<!--     window_size <- 5  # number of neighbors -->
+
+<!--     subject_data <- subject_data %>% -->
+<!--       group_by(trial) %>% -->
+<!--       mutate( -->
+
+<!--         # Check if the current trial is in our 'valid' list -->
+<!--         is_valid = trial %in% valid_trials, -->
+
+<!--         # ==== Moving Average Smoothing === -->
+<!--         GazeX_smooth = if_else(is_valid, rollapply(`GazePointX (MCSpx)`, -->
+<!--                                                    width=window_size, FUN=mean, -->
+<!--                                                    na.rm=TRUE, fill=NA, align="center"), NA_real_), -->
+
+<!--         GazeY_smooth = if_else(is_valid, rollapply(`GazePointY (MCSpx)`, -->
+<!--                                                    width=window_size, FUN=mean, -->
+<!--                                                    na.rm=TRUE, fill=NA, align="center"), NA_real_), -->
+
+<!--         # ==== Identify spikes ==== -->
+<!--         # Calculate distance between and velocity of gaze points -->
+<!--         vx = GazeX_smooth - lag(GazeX_smooth), -->
+<!--         vy = GazeY_smooth - lag(GazeY_smooth), -->
+<!--         dist = sqrt(vx^2 + vy^2), -->
+<!--         dt = (RecordingTimestamp - lag(RecordingTimestamp)) / 1000, -->
+<!--         vel = dist / dt, -->
+
+<!--         # Calculate distance/velocity threshold based on median absolute deviation -->
+<!--         dist_threshold = if_else(is_valid, median(dist, na.rm=TRUE) + 2.5 * mad(dist, na.rm=TRUE), NA_real_), -->
+
+<!--         vel_threshold  = if_else(is_valid, median(vel, na.rm=TRUE) + 2.5 * mad(vel, na.rm=TRUE), NA_real_), -->
+
+<!--         # Flag spikes in distance and velocity -->
+<!--         spike_flag = if_else(is_valid, (dist > dist_threshold) | (vel > vel_threshold), FALSE), -->
+
+<!--         GazeX_clean = if_else(is_valid & !spike_flag & GazeX_smooth >= 1, GazeX_smooth, NA_real_), -->
+<!--         GazeY_clean = if_else(is_valid & !spike_flag & GazeY_smooth >= 1, GazeY_smooth, NA_real_), -->
+
+<!--         # ==== Interpolate gaze points ==== -->
+<!--         GazeX_clean = if_else(is_valid, as.numeric(na.approx(GazeX_clean, na.rm=FALSE)), NA_real_), -->
+<!--         GazeY_clean = if_else(is_valid, as.numeric(na.approx(GazeY_clean, na.rm=FALSE)), NA_real_), -->
+
+<!--         # ==== Create Pupil Mean for valid gaze points ==== -->
+<!--         PupilMean = if_else(is_valid & !spike_flag, (PupilLeft + PupilRight) / 2, NA_real_), -->
+
+<!--         # ==== Interpolate Pupil Mean ==== -->
+<!--         PupilMean = if_else(is_valid, as.numeric(na.approx(PupilMean, na.rm=FALSE)), NA_real_) -->
+
+<!--       ) %>% -->
+<!--       select(-is_valid) %>% # remove helper column -->
+<!--       ungroup() -->
+
+
+<!--     # ==== Coordinate gaze coordinates to screen position ==== -->
+
+<!--     subject_data$Position = screen[cbind(subject_data$GazeY_clean, subject_data$GazeX_clean)] -->
+
+<!--     # NA out any Quadrant Position info that has a spike flag so we dont count these toward Fixation Count/ Dwell Time -->
+<!--     subject_data$Position = -->
+<!--       ifelse(subject_data$spike_flag == TRUE | subject_data$trial_valid == 0, -->
+<!--              NA, -->
+<!--              subject_data$Position) -->
+
+
+<!--     #Create variable indicating invalid gazepoints based on spike flag, invalid calibrations, and excess trial length -->
+<!--     subject_data <- subject_data %>% -->
+<!--       mutate(gazepoint_valid = if_else( -->
+<!--         coalesce(spike_flag, TRUE) ==TRUE | coalesce(calibration_valid, 0) ==0 | coalesce(trial_length_valid, 0)  == 0, 0, 1)) -->
+
+
+
+
+<!--     # ==== Coordinate image type with fixation position ==== -->
+
+<!--     subject_image_edata_long <- subject_image_edata %>% -->
+<!--       pivot_longer( -->
+<!--         cols = c(ULLabel, URLabel, BLLabel, BRLabel), -->
+<!--         names_to = "Quadrant", -->
+<!--         values_to = "ImageType" -->
+<!--       ) %>% -->
+<!--       mutate(Position = case_when( -->
+<!--         Quadrant == "ULLabel" ~ 1, -->
+<!--         Quadrant == "URLabel" ~ 2, -->
+<!--         Quadrant == "BLLabel" ~ 3, -->
+<!--         Quadrant == "BRLabel" ~ 4 -->
+<!--       )) %>% -->
+<!--       select(Trial, Position, ImageType) -->
+
+
+
+<!--     subject_data <- subject_data %>% -->
+<!--       left_join( -->
+<!--         subject_image_edata_long, -->
+<!--         by = c("trial" = "Trial", "Position" = "Position") -->
+<!--       ) -->
+
+<!--     subject_data$ImageType[subject_data$Position == 0] <- "Background" -->
+
+
+
+<!--     # =========================== Save individual data files ================================ -->
+
+<!--     # Remove unnecessary variables -->
+<!--     subject_data_select <- subject_data %>% select(ParticipantName, StudioVersionRec,  -->
+<!--                                                    FixationFilter, RecordingName,  -->
+<!--                                                    RecordingResolution, RecordingDuration,  -->
+<!--                                                    RecordingTimestamp, LocalTimeStamp,  -->
+<!--                                                    #full_datetime, -->
+<!--                                                    `GazePointX (MCSpx)`, `GazePointY (MCSpx)`,  -->
+<!--                                                    PupilLeft, PupilRight,  -->
+<!--                                                    ValidityLeft,ValidityRight, -->
+<!--                                                    trial, trial_duration, -->
+<!--                                                    FixationDuration, n_steps, n_steps_by_row, -->
+<!--                                                    dist, vel,   -->
+<!--                                                    GazeX_clean, GazeY_clean, -->
+<!--                                                    PupilMean, Position,ImageType, spike_flag,  -->
+<!--                                                    calibration_valid,  -->
+<!--                                                    trial_length_valid, -->
+<!--                                                    gazepoint_valid,trial_valid) -->
+
+
+<!--     # Save cleaned data file to box -->
+
+<!--     subject_file_name = paste0(subject_name,'_freeview_t1_processed.xlsx') -->
+
+<!--     write_box_file(subject_data_select,baseline_minimally_processed_folder_id, subject_file_name) -->
+
+
+<!--    # =========================== Save summary statistics  ================================ -->
+<!--     subject_data_unfiltered = subject_data # save a copy  -->
+
+<!--     subject_data = subject_data %>% -->
+<!--       filter(gazepoint_valid == 1, -->
+<!--              trial_valid ==1) -->
+
+
+
+<!--     # ==== Compute fixation time per trial × image type ==== -->
+<!--     fixation_by_trial <- subject_data %>% -->
+<!--       group_by(trial, ImageType) %>% -->
+<!--       summarise( -->
+<!--         total_fixation_time = sum(FixationDuration, na.rm = TRUE), -->
+<!--         fixation_count = sum(!is.na(FixationDuration)), -->
+<!--         pupil_size = mean(PupilMean,na.rm=TRUE), -->
+<!--         .groups = "drop" -->
+<!--       ) -->
+
+
+<!--     ## Include rows with Image Type info -->
+<!--     fixation_by_trial =  fixation_by_trial[complete.cases(fixation_by_trial$ImageType),] -->
+
+<!--     ## Average fixation time across trials by image type -->
+<!--     mean_fixation_by_type <- fixation_by_trial %>% -->
+<!--       group_by(ImageType) %>% -->
+<!--       summarise( -->
+<!--         MeanFixationTimeByTrial = mean(total_fixation_time, na.rm = TRUE), -->
+<!--         MeanFixationCountByTrial = mean(fixation_count, na.rm = TRUE), -->
+<!--         MeanPupilByTrial = mean(pupil_size,na.rm=TRUE), -->
+<!--         .groups = "drop") -->
+
+<!--     ## Convert to a wide format  -->
+<!--     mean_fixation_wide <- mean_fixation_by_type %>% -->
+<!--       pivot_wider( -->
+<!--         names_from = ImageType, -->
+<!--         values_from = c(MeanFixationTimeByTrial, MeanFixationCountByTrial,MeanPupilByTrial), -->
+<!--         names_glue = "{ImageType}{.value}") -->
+
+
+<!--     # ==== Save participant viewing statistics ==== -->
+
+<!--     subject_row = data.frame( -->
+<!--       subject = subject_name, -->
+<!--       Group = subject_image_edata$Group[1], -->
+<!--       TrialsKept = trials_kept, -->
+<!--       # FixationFilter = subject_data$FixationFilter[1], -->
+<!--       ExperimentVersion = edata$ExperimentVersion[1], -->
+
+<!--       SuicideFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Suicide"], na.rm = TRUE), -->
+<!--       NeutralFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Neutral"], na.rm = TRUE), -->
+<!--       SocialFixationTime    = sum(subject_data$FixationDuration[subject_data$ImageType == "Social"], na.rm = TRUE), -->
+<!--       DysphoricFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Dysphoric"], na.rm = TRUE), -->
+<!--       BackgroundFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Background"], na.rm = TRUE), -->
+
+<!--       SuicideFixationCount   = sum(subject_data$ImageType == "Suicide", na.rm = TRUE), -->
+<!--       NeutralFixationCount   = sum(subject_data$ImageType == "Neutral", na.rm = TRUE), -->
+<!--       SocialFixationCount    = sum(subject_data$ImageType == "Social", na.rm = TRUE), -->
+<!--       DysphoricFixationCount = sum(subject_data$ImageType == "Dysphoric", na.rm = TRUE), -->
+<!--       BackgroundFixationCount = sum(subject_data$ImageType == "Background", na.rm = TRUE),       -->
+
+<!--       SuicidePupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Suicide"], na.rm = TRUE), -->
+<!--       NeutralPupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Neutral"], na.rm = TRUE), -->
+<!--       SocialPupilSize    = mean(subject_data$PupilMean[subject_data$ImageType == "Social"], na.rm = TRUE), -->
+<!--       DysphoricPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Dysphoric"], na.rm = TRUE), -->
+<!--       BackgroundPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Background"], na.rm = TRUE) -->
+<!--     ) -->
+
+
+<!--     ## Cbind fixation time/ count by trial info -->
+<!--     subject_row= cbind(subject_row,mean_fixation_wide) -->
+
+<!--     summary_statistics = rbind(summary_statistics, subject_row) -->
+
+<!--     print(paste('Completed Subject',subject_name)) -->
+
+<!--   } else {next} -->
+<!-- } -->
+
+<!-- # write_box_file(summary_statistics,baseline_minimally_processed_folder_id, 'summary_statistics_freeview_t1_processed.xlsx') -->
+
+
+<!-- ``` -->
+
+
+Data cleaning  - 2/27 works!
+```{r}
+# summary_statistics = data.frame()
+# 
+# # for(f in files[216:length(files)]){
+# for(f in files){
+#   
+#   
+#   temp_file = read_box_file(input_path,f)
+#   
+#   # Read in data
+#   suppressWarnings({subject_data = read_xlsx(temp_file)})
+#   subject_name = strsplit(strsplit(f,"_")[[1]][3],"000")[[1]][[2]]
+#   
+#   if(subject_name %in% include_subjects){
+#     
+#     ## Pull meta data for subject
+#     subject_image_edata = outcomes_edata[which(outcomes_edata$ParticipantName == as.integer(subject_name)),]
+#     
+#     # ==== Calculating trial length ====
+#     
+#     ## Indicate current time 
+#     subject_data$full_datetime = strptime(
+#       paste(subject_data$RecordingDate, subject_data$LocalTimeStamp),
+#       format = "%m/%d/%Y %H:%M:%OS"
+#     )
+#     
+#     ## Calculate difference between current experiment time and start time
+#     subject_data$trial = NA_integer_
+#     
+#     ## Match trial start/end time with closest timestamp index
+#     for(trial in 1:nrow(subject_image_edata)){ 
+#       
+#       trial_start_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_start[trial]))
+#       
+#       trim_trial_start_time = subject_data$RecordingTimestamp[trial_start_time] #+ 500 # Allow for first 500ms
+#       
+#       trial_end_time = which.min(abs(subject_data$RecordingTimestamp - subject_image_edata$Trial_end[trial])) 
+#       
+#       trim_trial_end_time = subject_data$RecordingTimestamp[trial_end_time] #- 500 # Allow for last 500ms
+#       
+#       ## Assign trial only within trimmed window
+#       subject_data$trial[
+#         subject_data$RecordingTimestamp > trim_trial_start_time &
+#           subject_data$RecordingTimestamp < trim_trial_end_time
+#       ] <- trial
+#     }
+#     
+#     # Save copy of full data before cleaning invalid data
+#     subject_data_full = subject_data
+#     #subject_data = subject_data_full
+#     
+#     
+#     # Remove duplicate time stamps if any
+#     subject_data = subject_data[!duplicated(subject_data$RecordingTimestamp),]    
+#     
+#     
+#     # Calculate trial duration (keep all durations) 
+#     subject_data <- subject_data %>%
+#       group_by(trial) %>%
+#       mutate(trial_duration = as.numeric(difftime(max(full_datetime), min(full_datetime), units = "secs"))) %>%
+#       ungroup() 
+#     
+#     
+#     # ==== Flagging invalid calibrations ==== 
+#     
+#     # Define trial duration and percent of trial with valid calibrations in right and left eyes
+#     trial_percent_valid <- subject_data %>%
+#       group_by(trial) %>%
+#       summarize(
+#         percent_trial_valid = 100 * sum(ValidityLeft == 0 & ValidityRight == 0, na.rm = TRUE) / n(),
+#         trial_duration = as.numeric(difftime(max(full_datetime),min(full_datetime), units = "secs")),
+#         .groups = "drop")
+#     
+#     trial_percent_valid = trial_percent_valid[complete.cases(trial_percent_valid),]
+#     
+#     # Define outlier durations as invalid (1sd above the mean )
+#     duration_mean_1sd <- mean(trial_percent_valid$trial_duration, na.rm = TRUE) + 
+#       sd(trial_percent_valid$trial_duration, na.rm = TRUE)
+#     
+#     valid_trials <-   trial_percent_valid %>%
+#       filter(
+#         percent_trial_valid >= 80,
+#         trial_duration < duration_mean_1sd,
+#         !is.na(trial)
+#       ) %>%
+#       pull(trial)
+#     
+#     
+#     ## Not using in minimally processed: Filter subject_data to include only valid trials
+#     # subject_data <- subject_data %>%
+#     #   filter(trial %in% valid_trials)
+#     
+#     
+#     # Create column to indicate valid trials (valid trial = 1, invalid trial = 0)
+#     subject_data <- subject_data %>%
+#       mutate(trial_valid = case_when(
+#         trial %in% valid_trials~1,
+#         TRUE ~ 0 ))
+#     
+#     
+#     cat("Trials Kept:", paste(valid_trials, collapse = " "), "\n")
+#     
+#     trials_kept = length(valid_trials) 
+#     
+#     
+#     ## Calculate fixation milliseconds
+#     subject_data <- subject_data %>%
+#       group_by(trial) %>% 
+#       mutate(
+#         FixationDuration = if_else(
+#           trial_valid == 1,
+#           (lead(RecordingTimestamp) - RecordingTimestamp) / 1000,
+#           NA_real_
+#         )
+#       ) %>%
+#       ungroup() 
+#     
+#     subject_data<- subject_data %>%
+#       group_by(trial)%>%
+#       mutate(
+#         n_steps = RecordingTimestamp - min(RecordingTimestamp),
+#         n_steps_by_row = row_number()
+#       )
+#     
+#     # ==== Remove invalid data points ====
+#     
+#     # Remove non-trial data (fixation crosses, etc)
+#     subject_data <- subject_data %>%
+#       filter(!is.na(trial))
+#     # | !is.na(StudioEventIndex)
+#     
+#     # Create column to indicate  subject_data with valid calibrations (valid cal = 1, invalid cal= 0)
+#     subject_data <- subject_data %>%
+#       mutate(calibration_valid = case_when(
+#         (ValidityLeft == 0 & ValidityRight == 0)~1,
+#         TRUE ~ 0))
+#     
+#   
+#     # Cap trial duration (valid length = 1, invalid length = 0)
+#     subject_data <- subject_data %>% 
+#       group_by(trial)%>%
+#       mutate(trial_length_valid = case_when(
+#         n_steps <=30000~1,
+#         TRUE ~0
+#       ))
+#     
+#     
+#     ## Not using in minimally processed : remove non valid eye calibrations
+#     #subject_data = subject_data[((subject_data$ValidityLeft) == 0 & (subject_data$ValidityRight ==0)),]
+#     #subject_data = subject_data[!is.na(subject_data$ParticipantName), ]
+#     
+#     
+#     # ==== Smoothing, Flagging by Trial ===
+#     
+#     # Convert to numeric
+#     subject_data$`GazePointY (MCSpx)`= as.numeric(subject_data$`GazePointY (MCSpx)`)
+#     subject_data$`GazePointX (MCSpx)`= as.numeric(subject_data$`GazePointX (MCSpx)`)
+#     
+#     window_size <- 5  # number of neighbors
+#     
+#     subject_data <- subject_data %>%
+#       group_by(trial) %>%
+#       mutate(
+#         
+#         # Check if the current trial is in our 'valid' list
+#         is_valid = trial %in% valid_trials,
+#         
+#         # ==== Moving Average Smoothing ===
+#         GazeX_smooth = if_else(is_valid, rollapply(`GazePointX (MCSpx)`,
+#                                                    width=window_size, FUN=mean,
+#                                                    na.rm=TRUE, fill=NA, align="center"), NA_real_),
+#         
+#         GazeY_smooth = if_else(is_valid, rollapply(`GazePointY (MCSpx)`,
+#                                                    width=window_size, FUN=mean,
+#                                                    na.rm=TRUE, fill=NA, align="center"), NA_real_),
+#         
+#         # ==== Identify spikes ====
+#         # Calculate distance between and velocity of gaze points
+#         vx = GazeX_smooth - lag(GazeX_smooth),
+#         vy = GazeY_smooth - lag(GazeY_smooth),
+#         dist = sqrt(vx^2 + vy^2),
+#         dt = (RecordingTimestamp - lag(RecordingTimestamp)) / 1000,
+#         vel = dist / dt,
+#         
+#         # Calculate distance/velocity threshold based on median absolute deviation
+#         dist_threshold = if_else(is_valid, median(dist, na.rm=TRUE) + 2.5 * mad(dist, na.rm=TRUE), NA_real_),
+#         
+#         vel_threshold  = if_else(is_valid, median(vel, na.rm=TRUE) + 2.5 * mad(vel, na.rm=TRUE), NA_real_),
+#         
+#         # Flag spikes in distance and velocity
+#         spike_flag = if_else(is_valid, (dist > dist_threshold) | (vel > vel_threshold), FALSE),
+#         
+#         GazeX_clean = if_else(is_valid & !spike_flag & GazeX_smooth >= 1, GazeX_smooth, NA_real_),
+#         GazeY_clean = if_else(is_valid & !spike_flag & GazeY_smooth >= 1, GazeY_smooth, NA_real_),
+#         
+#         # ==== Interpolate gaze points ====
+#         GazeX_clean = if_else(is_valid, as.numeric(na.approx(GazeX_clean, na.rm=FALSE)), NA_real_),
+#         GazeY_clean = if_else(is_valid, as.numeric(na.approx(GazeY_clean, na.rm=FALSE)), NA_real_),
+#         
+#         # ==== Create Pupil Mean for valid gaze points ====
+#         PupilMean = if_else(is_valid & !spike_flag, (PupilLeft + PupilRight) / 2, NA_real_),
+#         
+#         # ==== Interpolate Pupil Mean ====
+#         PupilMean = if_else(is_valid, as.numeric(na.approx(PupilMean, na.rm=FALSE)), NA_real_)
+#         
+#       ) %>%
+#       select(-is_valid) %>% # remove helper column
+#       ungroup()
+#     
+#     
+#     # ==== Coordinate gaze coordinates to screen position ====
+#     
+#     subject_data$Position = screen[cbind(subject_data$GazeY_clean, subject_data$GazeX_clean)]
+#     
+#     # NA out any Quadrant Position info that has a spike flag so we dont count these toward Fixation Count/ Dwell Time
+#     subject_data$Position =
+#       ifelse(subject_data$spike_flag == TRUE | subject_data$trial_valid == 0,
+#              NA,
+#              subject_data$Position)
+#     
+#     
+#     #Create variable indicating invalid gazepoints based on spike flag, invalid calibrations, and excess trial length
+#     subject_data <- subject_data %>%
+#       mutate(gazepoint_valid = if_else(
+#         coalesce(spike_flag, TRUE) | coalesce(calibration_valid, 0) | coalesce(trial_length_valid, 0)  == 0, 0, 1))
+#     
+#     
+#   
+#     
+#     # ==== Coordinate image type with fixation position ====
+#     
+#     subject_image_edata_long <- subject_image_edata %>%
+#       pivot_longer(
+#         cols = c(ULLabel, URLabel, BLLabel, BRLabel),
+#         names_to = "Quadrant",
+#         values_to = "ImageType"
+#       ) %>%
+#       mutate(Position = case_when(
+#         Quadrant == "ULLabel" ~ 1,
+#         Quadrant == "URLabel" ~ 2,
+#         Quadrant == "BLLabel" ~ 3,
+#         Quadrant == "BRLabel" ~ 4
+#       )) %>%
+#       select(Trial, Position, ImageType)
+#     
+#     
+#     
+#     subject_data <- subject_data %>%
+#       left_join(
+#         subject_image_edata_long,
+#         by = c("trial" = "Trial", "Position" = "Position")
+#       )
+#     
+#     subject_data$ImageType[subject_data$Position == 0] <- "Background"
+#     
+#     
+#     
+#     
+#     
+#     # ==== Compute fixation time per trial × image type ====
+#     fixation_by_trial <- subject_data %>%
+#       group_by(trial, ImageType) %>%
+#       summarise(
+#         total_fixation_time = sum(FixationDuration, na.rm = TRUE),
+#         fixation_count = sum(!is.na(FixationDuration)),
+#         pupil_size = mean(PupilMean,na.rm=TRUE),
+#         .groups = "drop"
+#       )
+#     
+#     
+#     ## Include rows with Image Type info
+#     fixation_by_trial =  fixation_by_trial[complete.cases(fixation_by_trial$ImageType),]
+#     
+#     ## Average fixation time across trials by image type
+#     mean_fixation_by_type <- fixation_by_trial %>%
+#       group_by(ImageType) %>%
+#       summarise(
+#         MeanFixationTimeByTrial = mean(total_fixation_time, na.rm = TRUE),
+#         MeanFixationCountByTrial = mean(fixation_count, na.rm = TRUE),
+#         MeanPupilByTrial = mean(pupil_size,na.rm=TRUE),
+#         .groups = "drop")
+#     
+#     ## Convert to a wide format 
+#     mean_fixation_wide <- mean_fixation_by_type %>%
+#       pivot_wider(
+#         names_from = ImageType,
+#         values_from = c(MeanFixationTimeByTrial, MeanFixationCountByTrial,MeanPupilByTrial),
+#         names_glue = "{ImageType}{.value}")
+#     
+#     
+#     # ==== Save participant viewing statistics ====
+#     
+#     subject_row = data.frame(
+#       subject = subject_name,
+#       Group = subject_image_edata$Group[1],
+#       TrialsKept = trials_kept,
+#       # FixationFilter = subject_data$FixationFilter[1],
+#       ExperimentVersion = edata$ExperimentVersion[1],
+#       
+#       SuicideFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Suicide"], na.rm = TRUE),
+#       NeutralFixationTime   = sum(subject_data$FixationDuration[subject_data$ImageType == "Neutral"], na.rm = TRUE),
+#       SocialFixationTime    = sum(subject_data$FixationDuration[subject_data$ImageType == "Social"], na.rm = TRUE),
+#       DysphoricFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Dysphoric"], na.rm = TRUE),
+#       BackgroundFixationTime = sum(subject_data$FixationDuration[subject_data$ImageType == "Background"], na.rm = TRUE),
+#       
+#       SuicideFixationCount   = sum(subject_data$ImageType == "Suicide", na.rm = TRUE),
+#       NeutralFixationCount   = sum(subject_data$ImageType == "Neutral", na.rm = TRUE),
+#       SocialFixationCount    = sum(subject_data$ImageType == "Social", na.rm = TRUE),
+#       DysphoricFixationCount = sum(subject_data$ImageType == "Dysphoric", na.rm = TRUE),
+#       BackgroundFixationCount = sum(subject_data$ImageType == "Background", na.rm = TRUE),      
+#       
+#       SuicidePupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Suicide"], na.rm = TRUE),
+#       NeutralPupilSize   = mean(subject_data$PupilMean[subject_data$ImageType == "Neutral"], na.rm = TRUE),
+#       SocialPupilSize    = mean(subject_data$PupilMean[subject_data$ImageType == "Social"], na.rm = TRUE),
+#       DysphoricPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Dysphoric"], na.rm = TRUE),
+#       BackgroundPupilSize = mean(subject_data$PupilMean[subject_data$ImageType == "Background"], na.rm = TRUE)
+#     )
+#     
+#     
+#     
+#     # Remove unnecessary variables
+#     subject_data_select <- subject_data %>% select(ParticipantName, StudioVersionRec, 
+#                                                    FixationFilter, RecordingName, 
+#                                                    RecordingResolution, RecordingDuration, 
+#                                                    RecordingTimestamp, LocalTimeStamp, 
+#                                                    #full_datetime,
+#                                                    `GazePointX (MCSpx)`, `GazePointY (MCSpx)`, 
+#                                                    PupilLeft, PupilRight, 
+#                                                    ValidityLeft,ValidityRight,
+#                                                    trial, trial_duration,
+#                                                    FixationDuration, n_steps, n_steps_by_row,
+#                                                    dist, vel,  
+#                                                    GazeX_clean, GazeY_clean,
+#                                                    PupilMean, Position,ImageType, spike_flag, calibration_valid, 
+#                                                    trial_length_valid,
+#                                                    gazepoint_valid,trial_valid)
+#     
+#     
+#     
+#     ## Cbind fixation time/ count by trial info
+#     subject_row= cbind(subject_row,mean_fixation_wide)
+#     
+#     summary_statistics = rbind(summary_statistics, subject_row)
+#     
+#     subject_file_name = paste0(subject_name,'_freeview_t1_processed.xlsx')
+#     
+#     
+#     # ==== Save cleaned data file to box ====
+#     
+#     # write_box_file(subject_data_select,baseline_minimally_processed_folder_id, subject_file_name)
+#     
+#     print(paste('Completed Subject',subject_name))
+#     
+#   } else {next}
+# }
+# 
+# write_box_file(summary_statistics,baseline_minimally_processed_folder_id, 'summary_statistics_freeview_t1_processed.xlsx')
+
+
+```
+
+
+
+
+```{r}
+
+# 
+# temp = subject_data %>% select(trial, RecordingTimestamp, GazeX_clean,GazeY_clean,`GazePointX (MCSpx)`,`GazePointY (MCSpx)`, `FixationPointX (MCSpx)`,`FixationPointY (MCSpx)`) %>%
+#   filter(trial == 7)
+# 
+# plot(temp$RecordingTimestamp,temp$GazeY_clean,t = 'l',ylim = c(0,1920))
+# plot(temp$RecordingTimestamp,temp$`GazePointY (MCSpx)`,t = 'l',ylim = c(0,1920))
+# plot(temp$RecordingTimestamp,temp$`FixationPointY (MCSpx)`,t = 'l',ylim = c(0,1920))
+
+
+```
+
+```{r}
+
+# 
+# plot(temp$GazeX_clean, temp$GazeY_clean, type="l")
+# plot(temp$`GazePointX (MCSpx)`, temp$`GazePointY (MCSpx)`, type="l")
+# plot(temp$`FixationPointX (MCSpx)`, temp$`FixationPointY (MCSpx)`, type="l")
+
+
+
+```
+
