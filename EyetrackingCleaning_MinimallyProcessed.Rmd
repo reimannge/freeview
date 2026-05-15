@@ -30,13 +30,13 @@ Box API Tokens - Update these areas with token and desired output path
 # Generate token 
 # Configuration Link: https://carene.app.box.com/developers/console/app/2431769/configuration
 
-box_token <- 'OKxMs4CzOIQaItsypFAU8xT2PYgqpmiI'
+box_token <- 'FOOwdd7fNlgmdEJdlha9UfaHJQr8GX4e'
 auth_header <- add_headers(Authorization = paste("Bearer", box_token))
 
 
 # Assign desired output path 
 # Navigate to output folder and copy id in the URL (ex. https://carene.app.box.com/folder/342486719038)
-baseline_minimally_processed_folder_id = '368413816407' 
+baseline_minimally_processed_folder_id = '382195482136' 
 ```
 
 
@@ -168,6 +168,7 @@ include_subjects <- subject_list[!(subject_list %in% exclude_subjects)]
 Data cleaning 
 ```{r}
 summary_statistics = data.frame()
+
 
 # for(f in files[216:length(files)]){
 for(f in files){
@@ -404,20 +405,39 @@ for(f in files){
     
     # ==== Coordinate image type with fixation position ====
     
-    subject_image_edata_long <- subject_image_edata %>%
-      pivot_longer(
-        cols = c(ULLabel, URLabel, BLLabel, BRLabel),
-        names_to = "Quadrant",
-        values_to = "ImageType"
-      ) %>%
-      mutate(Position = case_when(
-        Quadrant == "ULLabel" ~ 1,
-        Quadrant == "URLabel" ~ 2,
-        Quadrant == "BLLabel" ~ 3,
-        Quadrant == "BRLabel" ~ 4
-      )) %>%
-      select(Trial, Position, ImageType)
+    # subject_image_edata_long <- subject_image_edata %>%
+    #   pivot_longer(
+    #     cols = c(ULLabel, URLabel, BLLabel, BRLabel),
+    #     names_to = "Quadrant",
+    #     values_to = "ImageType"
+    #   ) %>%
+    #   mutate(Position = case_when(
+    #     Quadrant == "ULLabel" ~ 1,
+    #     Quadrant == "URLabel" ~ 2,
+    #     Quadrant == "BLLabel" ~ 3,
+    #     Quadrant == "BRLabel" ~ 4
+    #   )) %>%
+    #   select(Trial, Position, ImageType)
+
     
+  subject_image_edata_long <- subject_image_edata %>%
+    pivot_longer(
+      cols = c(ULLabel, URLabel, BLLabel, BRLabel,
+               ULImage, URImage, BLImage, BRImage),
+      names_to = c("Quadrant", ".value"),
+      names_pattern = "(UL|UR|BL|BR)(Label|Image)"
+    ) %>%
+    mutate(
+      Position = case_when(
+        Quadrant == "UL" ~ 1,
+        Quadrant == "UR" ~ 2,
+        Quadrant == "BL" ~ 3,
+        Quadrant == "BR" ~ 4
+      )
+    ) %>%
+    select(Trial, Position, Label, Image)
+ 
+    names(subject_image_edata_long)[names(subject_image_edata_long) == "Label"] <- "ImageType" 
     
     
     subject_data <- subject_data %>%
@@ -427,6 +447,7 @@ for(f in files){
       )
     
     subject_data$ImageType[subject_data$Position == 0] <- "Background"
+    subject_data$Image[subject_data$Position == 0] <- "Background"
     
     
     
@@ -445,7 +466,7 @@ for(f in files){
                                                    FixationDuration, n_steps, n_steps_by_row,
                                                    dist, vel,  
                                                    GazeX_clean, GazeY_clean,
-                                                   PupilMean, Position,ImageType, spike_flag, 
+                                                   PupilMean, Position,ImageType,Image, spike_flag, 
                                                    calibration_valid, 
                                                    trial_length_valid,
                                                    gazepoint_valid,trial_valid)
@@ -537,7 +558,7 @@ for(f in files){
   } else {next}
 }
 
-# write_box_file(summary_statistics,baseline_minimally_processed_folder_id, 'summary_statistics_freeview_t1_processed.xlsx')
+write_box_file(summary_statistics,baseline_minimally_processed_folder_id, 'summary_statistics_freeview_t1_processed.xlsx')
 
 
 ```
